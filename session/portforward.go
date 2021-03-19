@@ -15,21 +15,14 @@
 package session
 
 import (
-	"context"
-	"io"
+	"fmt"
 	"net"
-	"strconv"
 	"time"
 
 	"github.com/mendersoftware/go-lib-micro/ws"
 	wspf "github.com/mendersoftware/go-lib-micro/ws/portforward"
 	"github.com/pkg/errors"
-	log "github.com/sirupsen/logrus"
-)
-
-const (
-	protocolTCP = "tcp"
-	protocolUDP = "udp"
+	"github.com/vmihailenco/msgpack/v5"
 )
 
 const (
@@ -38,245 +31,135 @@ const (
 )
 
 var (
-	errPortForwardInvalidMessage     = errors.New("invalid port-forward message: missing connection_id, remort_port or protocol")
 	errPortForwardUnkonwnMessageType = errors.New("unknown message type")
-	errPortForwardUnkonwnConnection  = errors.New("unknown connection")
 )
 
-var portForwarders = make(map[string]*MenderPortForwarder)
-
 type MenderPortForwarder struct {
-	ConnectionID   string
-	SessionID      string
-	ResponseWriter ResponseWriter
-	conn           net.Conn
-	ctx            context.Context
-	ctxCancel      context.CancelFunc
-}
-
-func (f *MenderPortForwarder) Connect(protocol string, host string, portNumber int) error {
-	log.Debugf("port-forward[%s/%s] connect: %s/%s:%d", f.SessionID, f.ConnectionID, protocol, host, portNumber)
-
-	if protocol == protocolTCP || protocol == protocolUDP {
-		conn, err := net.Dial(protocol, host+":"+strconv.Itoa(portNumber))
-		if err != nil {
-			return err
-		}
-		f.conn = conn
-	} else {
-		return errors.New("unknown protocol: " + protocol)
-	}
-
-	ctx, cancelFunc := context.WithCancel(context.Background())
-	f.ctx = ctx
-	f.ctxCancel = cancelFunc
-
-	go f.Read()
-
-	return nil
-}
-
-func (f *MenderPortForwarder) Close(sendStopMessage bool) error {
-	log.Debugf("port-forward[%s/%s] close", f.SessionID, f.ConnectionID)
-	if sendStopMessage {
-		m := &ws.ProtoMsg{
-			Header: ws.ProtoHdr{
-				Proto:     ws.ProtoTypePortForward,
-				MsgType:   wspf.MessageTypePortForwardStop,
-				SessionID: f.SessionID,
-				Properties: map[string]interface{}{
-					wspf.PropertyPortForwardConnectionID: f.ConnectionID,
-				},
-			},
-		}
-		if err := f.ResponseWriter.WriteProtoMsg(m); err != nil {
-			log.Errorf("portForwardHandler: webSock.WriteMessage(%+v)", err)
-		}
-	}
-	defer delete(portForwarders, f.SessionID+"/"+f.ConnectionID)
-	f.ctxCancel()
-	return f.conn.Close()
-}
-
-func (f *MenderPortForwarder) Read() {
-	errChan := make(chan error)
-	dataChan := make(chan []byte)
-
-	go func() {
-		data := make([]byte, portForwardBuffSize)
-
-		for {
-			n, err := f.conn.Read(data)
-			if err != nil {
-				errChan <- err
-				break
-			}
-			if n > 0 {
-				dataChan <- data[:n]
-			}
-		}
-	}()
-
-	for {
-		select {
-		case err := <-errChan:
-			if err != io.EOF {
-				log.Errorf("port-forward[%s/%s] error: %v\n", f.SessionID, f.ConnectionID, err.Error())
-			}
-			f.Close(true)
-		case data := <-dataChan:
-			log.Debugf("port-forward[%s/%s] read %d bytes", f.SessionID, f.ConnectionID, len(data))
-
-			m := &ws.ProtoMsg{
-				Header: ws.ProtoHdr{
-					Proto:     ws.ProtoTypePortForward,
-					MsgType:   wspf.MessageTypePortForward,
-					SessionID: f.SessionID,
-					Properties: map[string]interface{}{
-						wspf.PropertyPortForwardConnectionID: f.ConnectionID,
-					},
-				},
-				Body: data,
-			}
-			if err := f.ResponseWriter.WriteProtoMsg(m); err != nil {
-				log.Errorf("portForwardHandler: webSock.WriteMessage(%+v)", err)
-			}
-		case <-time.After(portForwardConnectionTimeout):
-			f.Close(true)
-		case <-f.ctx.Done():
-			return
-		}
-	}
-}
-
-func (f *MenderPortForwarder) Write(body []byte) error {
-	log.Debugf("port-forward[%s/%s] write %d bytes", f.SessionID, f.ConnectionID, len(body))
-	_, err := f.conn.Write(body)
-	if err != nil {
-		return err
-	}
-	return nil
+	conn   net.Conn
+	closed chan struct{}
 }
 
 func PortForward() Constructor {
-	f := HandlerFunc(portForwardHandler)
-	return func() SessionHandler { return f }
+	return func() SessionHandler {
+		return &MenderPortForwarder{
+			closed: make(chan struct{}),
+		}
+	}
 }
 
-func portForwardHandler(msg *ws.ProtoMsg, w ResponseWriter) {
+func (pf *MenderPortForwarder) ServeProtoMsg(msg *ws.ProtoMsg, w ResponseWriter) {
 	var err error
 	switch msg.Header.MsgType {
 	case wspf.MessageTypePortForwardNew:
-		err = portForwardHandlerNew(msg, w)
-	case wspf.MessageTypePortForwardStop:
-		err = portForwardHandlerStop(msg, w)
+		err = pf.HandleNewConn(msg, w)
+
 	case wspf.MessageTypePortForward:
-		err = portForwardHandlerForward(msg, w)
+		err = pf.HandleForward(msg, w)
+
+	case wspf.MessageTypePortForwardStop:
+		err = pf.Close()
+
 	default:
 		err = errPortForwardUnkonwnMessageType
 	}
-	if err != nil {
-		log.Errorf("portForwardHandler(%+v)", err)
 
-		response := &ws.ProtoMsg{
+	if err != nil {
+		errMsg := err.Error()
+		b, _ := msgpack.Marshal(wspf.Error{
+			Error:       &errMsg,
+			MessageType: &msg.Header.MsgType,
+		})
+		w.WriteProtoMsg(&ws.ProtoMsg{
 			Header: ws.ProtoHdr{
-				Proto:      ws.ProtoTypePortForward,
-				MsgType:    ws.MessageTypeError,
-				SessionID:  msg.Header.SessionID,
-				Properties: msg.Header.Properties,
+				Proto:     ws.ProtoTypePortForward,
+				MsgType:   wspf.MessageTypeError,
+				SessionID: msg.Header.SessionID,
 			},
-			Body: []byte(err.Error()),
-		}
-		if err := w.WriteProtoMsg(response); err != nil {
-			log.Errorf("portForwardHandler: webSock.WriteMessage(%+v)", err)
-		}
+			Body: b,
+		})
 	}
 }
 
-func getConnectionIDFromMessage(message *ws.ProtoMsg) string {
-	connectionID, _ := message.Header.Properties[wspf.PropertyPortForwardConnectionID].(string)
-	return connectionID
-}
+func (pf *MenderPortForwarder) HandleNewConn(msg *ws.ProtoMsg, w ResponseWriter) error {
+	var (
+		req wspf.PortForwardNew
+		err error
+	)
 
-func portForwardHandlerNew(message *ws.ProtoMsg, w ResponseWriter) error {
-	connectionID := getConnectionIDFromMessage(message)
-	protocol, _ := message.Header.Properties[wspf.PropertyPortForwardProtocol].(string)
-	host, _ := message.Header.Properties[wspf.PropertyPortForwardRemoteHost].(string)
-	portNumber, _ := message.Header.Properties[wspf.PropertyPortForwardRemotePort].(uint64)
-
-	if connectionID == "" || portNumber == 0 || protocol == "" {
-		return errPortForwardInvalidMessage
-	}
-
-	portForwarder := &MenderPortForwarder{
-		ConnectionID:   connectionID,
-		SessionID:      message.Header.SessionID,
-		ResponseWriter: w,
-	}
-
-	key := message.Header.SessionID + "/" + connectionID
-	portForwarders[key] = portForwarder
-
-	log.Infof("port-forward: new %s: %s/%s:%d", key, protocol, host, portNumber)
-	err := portForwarder.Connect(protocol, host, int(portNumber))
+	err = msgpack.Unmarshal(msg.Body, &req)
 	if err != nil {
-		delete(portForwarders, key)
-		return err
+		return errors.Wrap(err, "error decoding message")
 	}
 
-	response := &ws.ProtoMsg{
-		Header: ws.ProtoHdr{
-			Proto:     message.Header.Proto,
-			MsgType:   message.Header.MsgType,
-			SessionID: message.Header.SessionID,
-			Properties: map[string]interface{}{
-				wspf.PropertyPortForwardConnectionID: connectionID,
-			},
-		},
-	}
-	if err := w.WriteProtoMsg(response); err != nil {
-		log.Errorf("portForwardHandler: webSock.WriteMessage(%+v)", err)
+	// Validate request
+	if req.RemotePort == nil {
+		return errors.New("invalid port forward request: remote_port: cannot be blank")
 	}
 
+	if req.Protocol == nil {
+		proto := wspf.PortForwardProtocol(wspf.PortForwardProtocolTCP)
+		req.Protocol = &proto
+	}
+
+	if req.RemoteHost == nil {
+		emptyHost := ""
+		req.RemoteHost = &emptyHost
+	}
+
+	// Validate preconditions
+	if pf.conn != nil {
+		return errors.New("port-forwarding is already active on this session")
+	}
+
+	pf.conn, err = net.Dial(string(*req.Protocol), fmt.Sprintf("%s:%d", *req.RemoteHost, *req.RemotePort))
+	if err != nil {
+		return errors.Wrap(err, "failed to open port")
+	}
+	go pf.Reader(w, msg.Header.SessionID)
 	return nil
 }
 
-func portForwardHandlerStop(message *ws.ProtoMsg, w ResponseWriter) error {
-	connectionID := getConnectionIDFromMessage(message)
-	key := message.Header.SessionID + "/" + connectionID
-	if portForwarder, ok := portForwarders[key]; ok {
-		log.Infof("port-forward: stop %s", key)
-		defer delete(portForwarders, key)
-		if err := portForwarder.Close(false); err != nil {
-			return err
+func (pf *MenderPortForwarder) Reader(w ResponseWriter, sessionID string) {
+	buf := make([]byte, portForwardBuffSize)
+	for n, err := pf.conn.Read(buf); err == nil; n, err = pf.conn.Read(buf) {
+		select {
+		case <-pf.closed:
+			return
+		default:
 		}
-
-		response := &ws.ProtoMsg{
+		err = w.WriteProtoMsg(&ws.ProtoMsg{
 			Header: ws.ProtoHdr{
-				Proto:     message.Header.Proto,
-				MsgType:   message.Header.MsgType,
-				SessionID: message.Header.SessionID,
-				Properties: map[string]interface{}{
-					wspf.PropertyPortForwardConnectionID: connectionID,
-				},
+				Proto:     ws.ProtoTypePortForward,
+				MsgType:   wspf.MessageTypePortForward,
+				SessionID: sessionID,
 			},
+			Body: buf[:n],
+		})
+		if err != nil {
+			pf.Close()
+			break
 		}
-		if err := w.WriteProtoMsg(response); err != nil {
-			log.Errorf("portForwardHandler: webSock.WriteMessage(%+v)", err)
-		}
-
-		return nil
-	} else {
-		return errPortForwardUnkonwnConnection
 	}
 }
 
-func portForwardHandlerForward(message *ws.ProtoMsg, w ResponseWriter) error {
-	connectionID := getConnectionIDFromMessage(message)
-	key := message.Header.SessionID + "/" + connectionID
-	if portForwarder, ok := portForwarders[key]; ok {
-		return portForwarder.Write(message.Body)
-	} else {
-		return errPortForwardUnkonwnConnection
+func (pf *MenderPortForwarder) HandleForward(msg *ws.ProtoMsg, w ResponseWriter) error {
+	if pf.conn == nil {
+		return errors.New("no port-forward active on this session")
 	}
+	select {
+	case <-pf.closed:
+		return errors.New("port-forwarding already closed")
+	default:
+	}
+	_, err := pf.conn.Write(msg.Body)
+	return errors.Wrap(err, "failed to forward packet to local connection")
+}
+
+func (pf *MenderPortForwarder) Close() error {
+	var err error
+	if pf.conn != nil {
+		err = pf.conn.Close()
+	}
+	close(pf.closed)
+	return err
 }
