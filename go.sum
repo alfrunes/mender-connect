@@ -31,6 +31,8 @@ github.com/mendersoftware/go-lib-micro v0.0.0-20260507072508-a0998f726f15 h1:flR
 github.com/mendersoftware/go-lib-micro v0.0.0-20260507072508-a0998f726f15/go.mod h1:CzlSoiOQvmyxmGnSmT7uaIYTT1SQXYD0jjX+nl/X6Ms=
 github.com/mendersoftware/go-lib-micro v0.0.0-20260622093358-904960efc86d h1:KVDdGBGEwaCtlHw2bqnR0J34lbeZXTHokQuIlRKXAFo=
 github.com/mendersoftware/go-lib-micro v0.0.0-20260622093358-904960efc86d/go.mod h1:CzlSoiOQvmyxmGnSmT7uaIYTT1SQXYD0jjX+nl/X6Ms=
+github.com/mendersoftware/go-lib-micro v0.0.0-20260924120548-79a6e6f20ef9 h1:EUE5LAIuy2lpz3Bt9nTV3i81nlYgOQFWiEXPWZgz/Pw=
+github.com/mendersoftware/go-lib-micro v0.0.0-20260924120548-79a6e6f20ef9/go.mod h1:CzlSoiOQvmyxmGnSmT7uaIYTT1SQXYD0jjX+nl/X6Ms=
 github.com/pkg/diff v0.0.0-20210226163009-20ebb0f2a09e/go.mod h1:pJLUxLENpZxwdsKMEsNbx1VGcRFpLqf3715MtcvvzbA=
 github.com/pkg/errors v0.9.1 h1:FEBLx1zS214owpjy7qsBeixbURkuhQAwrK5UwLGTwt4=
 github.com/pkg/errors v0.9.1/go.mod h1:bwawxfHBFNV+L2hUp1rHADufV3IMtnDRdf1r5NINEl0=
