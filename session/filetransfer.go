@@ -296,12 +296,8 @@ func (h *FileTransferHandler) DownloadHandler(
 				msg.Header.MsgType,
 			)
 		}
-		if off, ok := msg.Header.Properties["offset"]; ok {
-			t, ok := off.(int64)
-			if !ok {
-				return msg, errors.New("invalid offset data type: require int64")
-			}
-			ackOffset = t
+		if off, ok := msg.Header.Properties["offset"].(int64); ok {
+			ackOffset = off
 		} else {
 			return msg, errors.New("ack message: offset property cannot be blank")
 		}
